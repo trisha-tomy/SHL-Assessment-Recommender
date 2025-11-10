@@ -1,0 +1,12 @@
+requests
+beautifulsoup4
+selenium
+tqdm
+Flask
+flask-cors
+numpy
+pandas
+openpyxl
+sentence-transformers
+torch
+google-genai # <--- ADD THIS LINE
