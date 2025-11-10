@@ -1,3 +1,4 @@
+# evaluate.py
 import json
 import os
 import sys
@@ -9,72 +10,127 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai.errors import APIError
+from sklearn.metrics.pairwise import cosine_similarity 
 
-# --- Data Augmentation Mapping ---\
-KEYWORD_MAP = {
-    "Competencies": "collaboration, communication, teamwork, leadership, problem-solving, decision-making, interpersonal",
-    "Personality & Behavior": "sales, motivation, drive, influence, conscientiousness, leadership potential, management",
-    "Knowledge & Skills": "technical, programming, java, python, sql, excel, coding, developer, expert, experienced",
-    "Ability & Aptitude": "numerical, verbal, logical, reasoning, critical thinking, abstract thinking, cognitive",
-    "Biodata & Situational Judgement": "real-world scenario, professional ethics, workplace behaviour, situational assessment",
-}
-
-# --- BOOSTING CONFIGURATION ---
+# --- CONFIGURATION (MUST MATCH Final Configuration) ---
+# FIX 1: Change to the more powerful/standard model for better results
+MODEL_NAME = 'all-mpnet-base-v2' 
+LLM_MODEL = 'gemini-2.5-flash'
+MAX_RECOMMENDATIONS = 10 
 DURATION_MULTIPLIER = 0.5 
-# Test Type Boosts are very small and CUMULATIVE (Additive)
-TYPE_ADDITIVE_WEIGHTS = {
-    "Knowledge & Skills": 0.03,  # Gentle boost for technical skills
-    "Competencies": 0.02,
-    "Ability & Aptitude": 0.01,
-}
-# Only include types that have a non-zero boost
-BOOSTED_TYPES = list(TYPE_ADDITIVE_WEIGHTS.keys())
+MIN_RECOMMENDATIONS = 5
+LOG_FILENAME = 'evaluation_log.csv' 
+EMBEDDINGS_FILE = 'shl_embeddings.json' 
 
+# Global variable for all assessment data
+all_assessments = []
 
-# --- 1. Load Data ---\
-# Load ground truth data
+# --- 1. Load Data ---
 try:
-    # Load from the 'Train-Set' sheet of the original XLSX file
     df_test = pd.read_excel('Gen_AI Dataset.xlsx', sheet_name='Train-Set')
-    # Group by query to get all relevant URLs for each query
+    # Group the URLs by query to get the list of ground truth assessments
     ground_truth = df_test.groupby('Query')['Assessment_url'].apply(list).to_dict()
     print(f"Loaded {len(ground_truth)} ground truth queries from the 'Train-Set' sheet (Excel).")
 except Exception as e:
-    print(f"Fatal Error reading data: {e}")
+    print(f"Fatal Error reading data (Gen_AI Dataset.xlsx): {e}")
+    sys.exit(1)
+
+# Load Assessments and Embeddings
+try:
+    with open(EMBEDDINGS_FILE, 'r') as f:
+        loaded_data = json.load(f)
+    
+    # Store full data (used for names and duration) and the matrix (used for similarity)
+    embeddings_list = []
+    
+    for item in loaded_data:
+        # Create a copy of the assessment dict and strip the embedding for the main list
+        clean_item = {k: v for k, v in item.items() if k != 'embedding'}
+        all_assessments.append(clean_item)
+        embeddings_list.append(item['embedding'])
+        
+    EMBEDDINGS_MATRIX = np.array(embeddings_list)
+    
+    print(f"Loaded {len(all_assessments)} assessments and embeddings.")
+except Exception as e:
+    print(f"Error loading '{EMBEDDINGS_FILE}': {e}")
     sys.exit(1)
 
 
-# --- URL Normalization Helper ---\
+# --- URL Normalization Helper (MUST MATCH app.py) ---
 def normalize_url(url):
-    """
-    Standardizes the URL for comparison by removing the domain, focusing on the path.
-    """
+    """Normalizes the URL format for consistent comparison, matching app.py logic."""
     if not isinstance(url, str):
         return ""
-    
+    # Standardize paths (replace /solutions/products/ with /products/)
     normalized_url = url.replace("/solutions/products/", "/products/")
+    # Remove protocol and domain for path-only comparison
     normalized_url = normalized_url.replace("https://www.shl.com", "")
-    
+    # Remove trailing slash for absolute consistency
+    if normalized_url.endswith('/'):
+        normalized_url = normalized_url[:-1]
     return normalized_url
 
-# --- 2. LLM Query Rewriting/Expansion ---\
-# Initialize Gemini Client
+# --- 2. LLM Initialization ---
+CLIENT = None
 try:
-    client = genai.Client()
+    # Use the environment variable, if available
+    if os.environ.get("GEMINI_API_KEY"):
+        CLIENT = genai.Client()
+        # No print here to avoid repeating in loop
 except Exception:
-    client = None
+    pass # Let the function handle the client being None
 
-def llm_rewrite_query(original_query):
-    # (LLM function remains the same for all strategies)
-    if not client:
-        return original_query
+
+# --- 3. Generative AI Stage 1: Aggressive Feature Extraction (Keyword-Only Fallback) ---
+
+def simple_keyword_fallback(query):
+    """
+    Guaranteed extraction of common job titles and skills (Keyword-Only Strategy), 
+    with aggressive repetition to match the embedding creation logic.
+    """
+    keywords = set() # Use a set to avoid duplicating extracted roles
+    
+    # Look for job roles/skills
+    roles = re.findall(r'(java|python|sql|developer|analyst|engineer|manager|sales|consultant|leadership)', query, re.IGNORECASE)
+    keywords.update(r.capitalize() for r in roles) # Capitalize for consistency
+    
+    # Look for general behavioral/aptitude keywords
+    if any(w in query.lower() for w in ['collaborat', 'teamwork', 'leadership', 'soft skills', 'personality', 'behavior']):
+        keywords.add('Personality & Behavior Competencies')
+    if any(w in query.lower() for w in ['cognitive', 'aptitude', 'numerical', 'verbal', 'ability', 'skills']):
+        keywords.add('Ability & Aptitude')
+    if 'sales' in query.lower():
+        keywords.add('Sales')
+
+    extracted_keywords_str = ' '.join(keywords)
+    
+    # FIX 2: Aggressively repeat keywords to match the create_embeddings.py file
+    repeated_keywords = f" {extracted_keywords_str}" * 4
         
+    # CRITICAL FIX: Restore the Original Query (Semantic Anchor) + Repeated Keywords
+    return query + repeated_keywords
+
+def llm_extract_features(original_query, use_llm=True):
+    """Attempts LLM expansion; falls back to simple keywords if unstable or specified."""
+    
+    if not use_llm:
+        return simple_keyword_fallback(original_query)
+        
+    global CLIENT
+    if not CLIENT: 
+        return simple_keyword_fallback(original_query)
+        
+    # --- LLM Expansion Prompt (Superior if it works) ---
     system_instruction = (
-        "You are an intelligent Query Expansion Engine for an Assessment Recommendation System. "
-        "Your task is to rewrite the given hiring query into a single, comprehensive paragraph "
-        "that includes all implied skills, job roles, duration constraints (in minutes), and necessary "
-        "assessment types (e.g., 'technical skills', 'behavioral competencies', 'aptitude', 'coding', 'sales'). "
-        "DO NOT add any conversational text. Only output the expanded query."
+        "You are an intelligent Query Feature Extraction Engine for an Assessment Recommendation System. "
+        "Your task is to analyze the given hiring query or job description (JD) and extract ALL "
+        "critical hiring features. Your response MUST be a single, long, comprehensive paragraph that "
+        "explicitly includes and repeats the key skills and assessment types. When extracting Test Types, "
+        "you MUST include: **'Knowledge & Skills', 'Personality & Behavior', 'Competencies', 'Ability & Aptitude', and 'Biodata & Situational Judgement'** "
+        "wherever the query implies those needs. "
+        "Maximize the number of relevant SHL category keywords and technical/behavioral skills. "
+        "DO NOT add any conversational text or explanation. Only output the extracted feature paragraph."
     )
     
     max_retries = 3
@@ -82,176 +138,224 @@ def llm_rewrite_query(original_query):
     
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=f"Original Query: {original_query}",
-                config={"system_instruction": system_instruction}
+            # FIX: Use contents as a list of strings if necessary for the client version
+            response = CLIENT.models.generate_content(
+                model=LLM_MODEL,
+                contents=[f"Original Query/JD: {original_query}"], 
+                system_instruction=system_instruction 
             )
-            return response.text.strip()
-        except APIError:
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
+            expanded_query = response.text.strip()
+            
+            # If LLM succeeds and returns output, use it
+            if expanded_query:
+                return expanded_query
             else:
-                return original_query
-        except Exception:
-            return original_query 
-    return original_query
+                return simple_keyword_fallback(original_query)
+                
+        except (APIError, Exception) as e:
+            # If API fails for any reason, use the manual keyword extraction
+            if attempt == max_retries - 1:
+                return simple_keyword_fallback(original_query)
+            time.sleep(base_delay * (2 ** attempt))
 
+    return simple_keyword_fallback(original_query) 
 
-# --- 3. Recommendation Core Logic ---\
+# --- 4. Core Recommendation Logic (Unified) ---
 
-def get_top_10_recommendations(original_query, embedding_model, all_assessments, assessment_embeddings, boost_strategy):
+def extract_duration(query):
     """
-    Core function to retrieve and score recommendations based on a chosen strategy.
+    Parses the query text to find a duration in minutes.
     """
-    # 1. LLM Query Expansion
-    expanded_query = llm_rewrite_query(original_query)
-    query_text = expanded_query
-    
-    # 2. Extract Duration (from the LLM-expanded query)
-    duration_match = re.search(r'(\d+)\s*(minutes?|hrs?|hours?|hour|min)', query_text, re.IGNORECASE)
-    query_duration = None
-    if duration_match:
-        value = int(duration_match.group(1))
-        unit = duration_match.group(2).lower()
-        query_duration = value * 60 if 'hr' in unit or 'hour' in unit else value
-    
-    
-    # --- A. Semantic Search (Cosine Similarity) ---
-    query_embedding = embedding_model.encode(query_text)
-    semantic_scores = np.dot(assessment_embeddings, query_embedding)
+    match_mins = re.search(r'(\d+)\s*(?:minutes|mins|min)', query, re.IGNORECASE)
+    if match_mins:
+        return int(match_mins.group(1))
+
+    match_hours = re.search(r'(\d+)\s*hour(?:s)?', query, re.IGNORECASE)
+    if match_hours:
+        return int(match_hours.group(1)) * 60
+
+    match_max = re.search(r'(?:max|duration|not more than)\s+[\w\s]*?(\d+)', query, re.IGNORECASE)
+    if match_max:
+        num = int(match_max.group(1))
+        if 5 <= num <= 180: 
+             return num
+
+    return None
+
+# Global model instance for efficiency (using the updated MODEL_NAME)
+try:
+    EMBEDDING_MODEL = SentenceTransformer(MODEL_NAME)
+except Exception as e:
+    print(f"Fatal Error: Could not load SentenceTransformer model '{MODEL_NAME}'. Error: {e}")
+    sys.exit(1)
+
+
+def get_recommendations_urls(search_query, original_query):
+    """
+    Generates recommendations based on semantic search of 'search_query' and 
+    duration boosting based on 'original_query', enforcing uniqueness.
+    Returns a list of up to MAX_RECOMMENDATIONS assessment URLs and Names.
+    """
+    # 1. Embed the search query
+    try:
+        query_embedding = EMBEDDING_MODEL.encode(search_query, convert_to_tensor=False)
+        query_embedding = np.expand_dims(query_embedding, axis=0) 
+    except Exception as e:
+        print(f"Error embedding query: {e}", file=sys.stderr)
+        return [], []
+
+    # 2. Extract duration from original query
+    query_duration = extract_duration(original_query)
+
+    # 3. Calculate Semantic Scores (Cosine Similarity)
+    semantic_scores = cosine_similarity(query_embedding, EMBEDDINGS_MATRIX)[0]
     
     final_scores = []
     
-    # --- B. Apply Final Boosts ---
+    # 4. Apply Final Duration Boost
     for i, item in enumerate(all_assessments):
         semantic_score = semantic_scores[i]
-        
-        # --- Duration Boost (Multiplier) ---
-        duration_multiplier = 0.0
+
+        duration_boost_factor = 0.0
         doc_duration = item.get('duration')
-        
-        if query_duration and doc_duration:
+
+        if query_duration is not None and doc_duration:
+            # Set tolerance as 25% of the query duration, minimum 15 minutes
             tolerance = max(15, query_duration * 0.25) 
+
+            # Check if duration is non-numeric, matching app.py logic
+            if not isinstance(doc_duration, (int, float)):
+                 doc_duration = 0
+                 
             if abs(doc_duration - query_duration) <= tolerance:
-                duration_multiplier = DURATION_MULTIPLIER 
-        
-        total_boost = duration_multiplier
-        final_score = semantic_score * (1 + total_boost)
-        
-        # --- ADDITIVE Boost for Enhanced Boosting Strategy ---
-        if boost_strategy == 'ENHANCED_BOOST':
-            additive_boost = 0.0
-            
-            # Check for Test Type matches (Additive Boost)
-            for doc_type in item.get('test_type', []):
-                if doc_type in BOOSTED_TYPES:
-                    # Check if the type/keywords are mentioned in the LLM's query
-                    keywords = [doc_type]
-                    if doc_type in KEYWORD_MAP:
-                        keywords.extend(KEYWORD_MAP[doc_type].split(', '))
-                    
-                    if any(k.strip().lower() in query_text.lower() for k in keywords):
-                        additive_boost += TYPE_ADDITIVE_WEIGHTS[doc_type]
-                        
-            # Use Additive Boost on the final score for the ENHANCED strategy
-            final_score += additive_boost
+                duration_boost_factor = DURATION_MULTIPLIER 
 
-
+        # Final score calculation: semantic_score * (1 + boost)
+        final_score = semantic_score * (1 + duration_boost_factor)
         final_scores.append(final_score)
 
-    # Get the top 10 indices
+    # 5. Get the Top N indices
     final_scores = np.array(final_scores)
-    top_indices = np.argsort(final_scores)[-10:][::-1]
-    
-    # Retrieve the URLs based on the top indices
-    assessment_urls = [item['url'] for item in all_assessments]
-    predicted_urls = [assessment_urls[i] for i in top_indices]
-    return predicted_urls
+    # Get indices for ALL assessments, sorted from best to worst
+    all_sorted_indices = np.argsort(final_scores)[::-1] 
 
+    # 6. Retrieve URLs while enforcing UNIQUNESS 
+    predicted_urls = []
+    predicted_names = []
+    recommended_normalized_urls = set()
+    
+    for index in all_sorted_indices:
+        item = all_assessments[index]
+        original_url = item.get('url')
+        
+        # Use the normalized URL for the set check
+        normalized_url = normalize_url(original_url)
+        
+        # CRITICAL DEDUPLICATION STEP
+        if normalized_url and normalized_url not in recommended_normalized_urls:
+            # Append the normalized URL for recall calculation
+            predicted_urls.append(normalized_url) 
+            predicted_names.append(item.get('name', 'N/A'))
+            recommended_normalized_urls.add(normalized_url)
+        
+        # Stop once we have MAX_RECOMMENDATIONS unique items
+        if len(predicted_urls) >= MAX_RECOMMENDATIONS:
+            break
+            
+    return predicted_urls, predicted_names
+
+
+# --- 5. Evaluation Function (Remains mostly the same) ---
 
 def calculate_recall_at_10(predicted_list, actual_list):
-    """
-    Calculates Recall@10 for a single query using robust URL normalization.
-    """
-    # Normalize ALL URLs before creating the sets for comparison
-    normalized_actual_set = set(normalize_url(url) for url in actual_list)
-    normalized_predicted_list = [normalize_url(url) for url in predicted_list]
+    """Calculates Recall@10 based on normalized URLs."""
+    # actual_list is already normalized when created in the main loop
+    normalized_actual_set = set(actual_list)
     
     relevant_found = 0
-    for url in normalized_predicted_list:
+    for url in predicted_list: # predicted_list already contains normalized URLs from get_recommendations_urls
         if url in normalized_actual_set:
             relevant_found += 1
     
     total_relevant = len(normalized_actual_set)
-    
-    if total_relevant == 0:
-        return 0.0
-        
-    return relevant_found / total_relevant
+    return relevant_found / total_relevant if total_relevant > 0 else 0.0
 
 
-def run_evaluation(model_name, boost_strategy, log_name):
-    """Loads model/data and runs the full evaluation loop for one strategy."""
-    print(f"\n--- Running Strategy: {log_name} ---")
+def run_evaluation(model_name, strategy_name, use_llm):
     
-    # --- Load Local Model (Specific for this run) ---
-    try:
-        model = SentenceTransformer(model_name)
-    except Exception as e:
-        print(f"Skipping {log_name}: Could not load model {model_name}. Error: {e}")
-        return
-    
-    # --- Load Embeddings (Assumes embeddings file exists for the chosen model) ---
-    # NOTE: Since the embeddings file is generic ('shl_embeddings.json'), 
-    # we assume 'create_embeddings.py' was last run with the correct model (MPNet in this case).
-    try:
-        with open('shl_embeddings.json', 'r') as f:
-            assessments = json.load(f)
+    # We use the globally initialized EMBEDDING_MODEL for consistency
+    model = EMBEDDING_MODEL
         
-        embeddings = np.array([item['embedding'] for item in assessments])
-    except FileNotFoundError:
-        print("Skipping: 'shl_embeddings.json' not found. Please run 'create_embeddings.py'.")
-        return
-    
     recall_scores = []
+    log_data = [] 
     
+    print(f"\n--- Running Strategy: {strategy_name} ---")
+
     for query, actual_urls in tqdm(ground_truth.items(), desc="Evaluating Queries"):
         
-        predicted_urls = get_top_10_recommendations(
-            query, 
-            model, 
-            assessments, 
-            embeddings, 
-            boost_strategy
+        # Determine the search query (original or LLM enhanced)
+        llm_query = llm_extract_features(query, use_llm=use_llm)
+        search_query = llm_query # S2 uses LLM output; S1 uses simple_keyword_fallback output
+        
+        predicted_urls, predicted_names = get_recommendations_urls(
+            search_query=search_query, 
+            original_query=query # Always use original query for duration check
         )
-        recall = calculate_recall_at_10(predicted_urls, actual_urls)
+        
+        # Normalize the ground truth URLs for accurate comparison
+        normalized_actual_urls = [normalize_url(url) for url in actual_urls]
+        
+        recall = calculate_recall_at_10(predicted_urls, normalized_actual_urls)
         recall_scores.append(recall)
+
+        # Print the keywords/query used for the search
+        keywords_only = llm_query.replace(query, '').strip()
+
+        if use_llm:
+            print(f"\nQUERY: {query[:40]}... -> LLM QUERY (Generated): {llm_query[:50]}...")
+        else:
+            print(f"\nQUERY: {query[:40]}... -> KEYWORDS USED (Extracted): {keywords_only[:50]}...") # Truncate for clean output
+
+        
+        # Log the detailed results for analysis
+        log_data.append({
+            'Strategy': strategy_name,
+            'Original Query': query,
+            'LLM Enhanced Query': llm_query,
+            'Recall@10': f"{recall:.2f}",
+            'Ground Truth URLs': ' || '.join(normalized_actual_urls),
+            'Predicted URLs': ' || '.join(predicted_urls),
+            'Predicted Names': ' || '.join(predicted_names)
+        })
+
+    # Save log file (Appending to previous logs)
+    df_log = pd.DataFrame(log_data)
+    if os.path.exists(LOG_FILENAME):
+        df_log.to_csv(LOG_FILENAME, mode='a', header=False, index=False)
+    else:
+        df_log.to_csv(LOG_FILENAME, index=False)
 
     if recall_scores:
         mean_recall_at_10 = sum(recall_scores) / len(recall_scores)
-        print(f"\n[{log_name}] Mean Recall @ 10: {mean_recall_at_10:.4f} ({mean_recall_at_10 * 100:.2f}%)")
+        print(f"\n[{strategy_name}] Mean Recall @ 10: {mean_recall_at_10:.4f} ({mean_recall_at_10 * 100:.2f}%)")
+        print(f"Detailed log appended to {LOG_FILENAME}")
     else:
-        print(f"[{log_name}] No scores calculated.")
+        print(f"[{strategy_name}] No scores calculated.")
 
 
-# --- 4. Run Multi-Strategy Evaluation ---\
+# --- 6. Run Evaluation ---
 if __name__ == "__main__":
     
-    # --- Strategy 1: The Baseline Winner (MPNet + High Multiplier) ---
-    # This should reproduce your ~30.44% score, confirming the Name Weighting was the issue.
+    # Scenario 1: Keyword-Only (Guaranteed Baseline)
     run_evaluation(
-        model_name='all-mpnet-base-v2',
-        boost_strategy='BASELINE',
-        log_name='BASELINE_MPNET_PURE_SEMANTIC'
+        model_name=MODEL_NAME,
+        strategy_name='S1_SEMANTIC_ONLY_BOOSTED',
+        use_llm=False
     )
-    
-    # --- Strategy 2: Enhanced Boosting (MPNet + High Multiplier + Subtle Additive Type Boost) ---
-    # We test if the subtle ADDITIVE boost can push the baseline higher.
-    # run_evaluation(
-    #     model_name='all-mpnet-base-v2',
-    #     boost_strategy='ENHANCED_BOOST',
-    #     log_name='ENHANCED_MPNET_ADDITIVE_TYPE'
-    # )
 
-    # print("\n--- Summary: Re-run create_embeddings.py with BGE-Small to test Hypothesis 3! ---")
+    # Scenario 2: Full LLM Attempt (Superior if it works, falls back gracefully)
+    run_evaluation(
+        model_name=MODEL_NAME,
+        strategy_name='S2_LLM_ENRICHED_BOOSTED',
+        use_llm=True
+    )

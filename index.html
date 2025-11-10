@@ -22,6 +22,7 @@
             background-color: #fff;
             border-radius: 8px;
             box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
         }
         textarea { 
             width: calc(100% - 20px); /* Adjust for padding */
@@ -30,6 +31,7 @@
             padding: 10px;
             border: 1px solid #ccc;
             border-radius: 5px;
+            resize: vertical;
         }
         button { 
             background-color: #007bff; 
@@ -37,125 +39,126 @@
             padding: 12px 20px;
             border: none; 
             border-radius: 5px; 
-            font-size: 16px; 
             cursor: pointer;
-            display: block;
             width: 100%;
+            font-size: 16px;
             margin-top: 10px;
+            transition: background-color 0.3s ease;
         }
         button:hover { 
             background-color: #0056b3; 
         }
-        #results-container { 
-            margin-top: 20px; 
+        #results {
+            margin-top: 20px;
         }
-        .result-item { 
+        .result-item {
             background-color: #fff;
-            border: 1px solid #ddd; 
-            border-radius: 8px; 
-            padding: 15px; 
-            margin-bottom: 10px; 
-            box-shadow: 0 2px 3px rgba(0,0,0,0.05);
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            margin-bottom: 15px;
+            border-left: 5px solid #003a6c;
         }
-        .result-item h3 { 
-            margin-top: 0; 
-            color: #0056b3;
+        .result-item h3 {
+            margin-top: 0;
+            margin-bottom: 5px;
+            color: #003a6c;
+            font-size: 1.25rem;
         }
-        .result-item a { 
-            text-decoration: none; 
-            font-weight: bold;
+        .result-item h3 a {
+            text-decoration: none;
+            color: inherit;
         }
-        .result-item p { 
-            font-size: 14px; 
-            line-height: 1.5;
-        }
-        .result-item .badge-container {
-            margin-top: 10px;
-        }
-        .result-item .badge { 
-            background-color: #eee; 
+        .result-item p {
+            font-size: 0.95rem;
             color: #555;
-            padding: 5px 8px; 
-            border-radius: 12px; 
-            font-size: 12px;
-            display: inline-block;
-            margin-right: 5px;
+            margin-bottom: 10px;
         }
-        #loading-message {
+        .badge-container {
+            margin-bottom: 10px;
+        }
+        .badge {
+            display: inline-block;
+            background-color: #e0f7fa; /* Light Blue */
+            color: #007bff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            margin-right: 5px;
+            font-weight: 600;
+        }
+        .loading-message {
             text-align: center;
-            font-size: 18px;
-            color: #777;
-            display: none; /* Hidden by default */
+            padding: 20px;
+            color: #007bff;
+        }
+        .error-message {
+            text-align: center;
+            padding: 20px;
+            color: #d9534f;
+            background-color: #fdd;
+            border-radius: 5px;
         }
     </style>
 </head>
 <body>
 
-    <h2>🤖 SHL Assessment Recommender</h2>
+    <h2>SHL Assessment Recommendation System</h2>
 
     <div id="query-container">
-        <textarea id="job-description" placeholder="Paste your job description or query here..."></textarea>
+        <label for="query-text">Enter Job Description or Query:</label>
+        <textarea id="query-text" placeholder="e.g., Senior Data Analyst with Python/SQL skills, max 90 minutes."></textarea>
         <button id="recommend-button">Get Recommendations</button>
     </div>
 
-    <div id="results-container">
-        <div id="loading-message">Fetching recommendations...</div>
-        </div>
+    <div id="results">
+        <p style="text-align: center; color: #777;">Enter a query above to find relevant assessments.</p>
+    </div>
 
     <script>
-        // Get references to the HTML elements
-        const recommendButton = document.getElementById('recommend-button');
-        const jobDescription = document.getElementById('job-description');
-        const resultsContainer = document.getElementById('results-container');
-        const loadingMessage = document.getElementById('loading-message');
+        document.getElementById('recommend-button').addEventListener('click', fetchRecommendations);
 
-        // Set the URL of your local Flask API
-        const API_URL = 'http://127.0.0.1:5000/recommend';
+        const queryTextarea = document.getElementById('query-text');
+        const resultsContainer = document.getElementById('results');
+        const API_URL = 'http://127.0.0.1:5000/recommend'; 
 
-        // Add a "click" event listener to the button
-        recommendButton.addEventListener('click', async () => {
-            const query = jobDescription.value;
+        async function fetchRecommendations() {
+            const query = queryTextarea.value.trim();
 
-            // Simple check
-            if (query.trim() === '') {
-                alert('Please enter a query or job description.');
+            if (query.length < 5) {
+                resultsContainer.innerHTML = '<p class="error-message">Please enter a query of at least 5 characters.</p>';
                 return;
             }
 
-            // Show "Loading..." and clear old results
-            loadingMessage.style.display = 'block';
-            resultsContainer.innerHTML = ''; // Clear previous results
+            resultsContainer.innerHTML = '<p class="loading-message">Searching for assessments...</p>';
 
             try {
-                // This is the API call
                 const response = await fetch(API_URL, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ 'query': query }) // Send the query as JSON
+                    body: JSON.stringify({ query: query })
                 });
 
-                loadingMessage.style.display = 'none'; // Hide "Loading..."
-
+                // Check for HTTP errors (4xx or 5xx)
                 if (!response.ok) {
-                    // Handle errors from the server (like 500, 400)
-                    throw new Error(`HTTP error! Status: ${response.status}`);
+                    const errorDetails = await response.json().catch(() => ({}));
+                    throw new Error(`HTTP error! Status: ${response.status}. Details: ${errorDetails.error || 'Server error'}`);
                 }
+                
+                const recommendations = await response.json();
+                
+                // CRITICAL DEBUG STEP: Log the received data
+                console.log("Received data:", recommendations); 
 
-                // Get the JSON data from the response
-                const data = await response.json();
-
-                // Build and display the results
-                displayResults(data.recommended_assessments);
+                displayResults(recommendations);
 
             } catch (error) {
-                // Handle network errors (like API not running)
-                console.error('Error fetching recommendations:', error);
-                loadingMessage.style.display = 'none'; // Hide "Loading..."
-                resultsContainer.innerHTML = `<p style="color: red; text-align: center;"><b>Error:</b> Could not connect to the API. Is app.py running?</p>`;
+                console.error('Fetch error:', error);
+                resultsContainer.innerHTML = `<p class="error-message">Error connecting to the server: ${error.message}. Please check if app.py is running and accessible at 127.0.0.1:5000.</p>`;
             }
-        });
+        }
 
         // This function builds the HTML for each recommendation
         function displayResults(recommendations) {
@@ -168,20 +171,30 @@
 
             // Loop through each recommendation and create an HTML "card" for it
             recommendations.forEach(item => {
-                const testTypesHtml = item.test_type.map(type => `<span class="badge">${type}</span>`).join(' ');
+                // Ensure test_type is an array before mapping
+                const testTypes = Array.isArray(item.test_type) ? item.test_type : [item.test_type].filter(t => t);
+                const testTypesHtml = testTypes.map(type => `<span class="badge">${type || 'N/A'}</span>`).join(' ');
+
+                // Fallback for critical fields
+                const name = item.name || 'Assessment Name Missing';
+                const url = item.url || '#';
+                const description = item.description || 'No description available.';
+                const duration = item.duration ? item.duration + ' mins' : 'N/A';
 
                 const resultHtml = `
                     <div class="result-item">
-                        <h3><a href="${item.url}" target="_blank">${item.name}</a></h3>
-                        <p>${item.description}</p>
+                        <h3><a href="${url}" target="_blank">${name}</a></h3>
+                        <p>${description}</p>
                         <div class="badge-container">
                             ${testTypesHtml}
                         </div>
                         <small>
-                            Duration: ${item.duration ? item.duration + ' mins' : 'N/A'} | 
-                            Remote: ${item.remote_support} | 
-                            Adaptive: ${item.adaptive_support}
+                            Duration: ${duration} | 
+                            Remote: ${item.remote_support || 'N/A'} | 
+                            Adaptive: ${item.adaptive_support || 'N/A'}
                         </small>
+                        <!-- Debugging: Show Score -->
+                        <div style="font-size: 0.7rem; color: #aaa; margin-top: 5px;">Score: ${item.score ? item.score.toFixed(4) : 'N/A'}</div>
                     </div>
                 `;
                 resultsContainer.innerHTML += resultHtml;

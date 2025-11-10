@@ -1,226 +1,248 @@
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 import json
-import os
-import sys
 import numpy as np
 import re
-import time
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import os
+import sys
+import copy 
 from sentence_transformers import SentenceTransformer
-from google import genai
-from google.genai.errors import APIError
+from sklearn.metrics.pairwise import cosine_similarity
 
-# --- CONFIGURATION (MUST MATCH evaluate.py) ---
+# --- CONFIGURATION (MUST MATCH other files) ---
 MODEL_NAME = 'all-mpnet-base-v2'
 DURATION_MULTIPLIER = 0.5 
-MAX_RECOMMENDATIONS = 10 # Requirement: max 10 recommendations
+MAX_RECOMMENDATIONS = 10 
+EMBEDDINGS_FILE = 'shl_embeddings.json'
 
-# --- 1. Initialize Components ---\
+# Global variables for loaded data
+ASSESSMENTS_DATA = []
+EMBEDDINGS_MATRIX = None
 
-# Initialize Gemini Client
+# --- URL Normalization Helper (NEWLY ADDED) ---
+def normalize_url(url):
+    """Normalizes the URL format for consistent comparison, matching evaluate.py logic."""
+    if not isinstance(url, str):
+        return ""
+    # Standardize paths (replace /solutions/products/ with /products/)
+    normalized_url = url.replace("/solutions/products/", "/products/")
+    # Remove protocol and domain for path-only comparison
+    normalized_url = normalized_url.replace("https://www.shl.com", "")
+    # Remove trailing slash for absolute consistency
+    if normalized_url.endswith('/'):
+        normalized_url = normalized_url[:-1]
+    return normalized_url
+
+
+# --- 1. Load Data and Model ---
 try:
-    client = genai.Client()
-except Exception:
-    client = None
+    # Load the complete data once
+    with open(EMBEDDINGS_FILE, 'r') as f:
+        loaded_data = json.load(f)
 
-# Load Local Embedding Model
-print(f"Loading local embedding model ({MODEL_NAME})...")
-try:
-    EMBEDDING_MODEL_LOCAL = SentenceTransformer(MODEL_NAME)
-    print("Model loaded successfully.")
+    ASSESSMENTS_DATA = []
+    embeddings_list = []
+    
+    # Process the loaded data to separate assessment details from embeddings
+    for i, item in enumerate(loaded_data):
+        if 'embedding' not in item or not isinstance(item['embedding'], list):
+            print(f"Skipping item {i}: Missing or invalid 'embedding' key.")
+            continue
+            
+        # Create a clean copy of the assessment dictionary for the application
+        clean_item = {k: v for k, v in item.items() if k != 'embedding'}
+        ASSESSMENTS_DATA.append(clean_item)
+        
+        # Extract the embedding to build the matrix
+        embeddings_list.append(item['embedding'])
+        
+    EMBEDDINGS_MATRIX = np.array(embeddings_list)
+    
+    # CRITICAL CHECK: Ensure the lists are aligned
+    if len(ASSESSMENTS_DATA) != len(EMBEDDINGS_MATRIX):
+        raise ValueError(f"Data loading error: Mismatched lengths. Data List ({len(ASSESSMENTS_DATA)}) != Embedding Matrix ({len(EMBEDDINGS_MATRIX)})")
+
+    print(f"Successfully loaded {len(ASSESSMENTS_DATA)} assessments and embeddings.")
+
+except FileNotFoundError:
+    print(f"Fatal Error: The file '{EMBEDDINGS_FILE}' was not found. Please run create_embeddings.py first.", file=sys.stderr)
+    sys.exit(1)
 except Exception as e:
-    print(f"Error loading model: {e}")
+    print(f"Fatal Error during data loading: {e}", file=sys.stderr)
     sys.exit(1)
 
-# --- Basic App Setup ---\
-app = Flask(__name__)
-CORS(app) 
+try:
+    # Initialize the local embedding model
+    EMBEDDING_MODEL = SentenceTransformer(MODEL_NAME)
+    print("Embedding model loaded successfully.")
+except Exception as e:
+    print(f"Fatal Error: Could not load SentenceTransformer model '{MODEL_NAME}'. Error: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# --- Database Variables ---\
-all_assessments = []
-assessment_embeddings = None
 
+# --- 2. Helper Functions (Duration remains unchanged) ---
 
-def get_query_embedding(query_text):
-    """Generates an embedding for the user's query using the local model."""
-    try:
-        return EMBEDDING_MODEL_LOCAL.encode(query_text)
-    except Exception as e:
-        print(f"Error embedding query: {e}")
-        return None
+def extract_duration(query):
+    # ... (Duration logic remains the same)
+    match_mins = re.search(r'(\d+)\s*(?:minutes|mins|min)', query, re.IGNORECASE)
+    if match_mins:
+        return int(match_mins.group(1))
 
-# --- Generative AI Logic (Unstructured Expansion) ---\
-def llm_rewrite_query(original_query):
+    match_hours = re.search(r'(\d+)\s*hour(?:s)?', query, re.IGNORECASE)
+    if match_hours:
+        return int(match_hours.group(1)) * 60
+
+    match_max = re.search(r'(?:max|duration|not more than)\s+[\w\s]*?(\d+)', query, re.IGNORECASE)
+    if match_max:
+        num = int(match_max.group(1))
+        if 5 <= num <= 180: 
+             return num
+
+    return None
+
+def get_recommendations(query):
     """
-    Uses the Gemini API to expand and enrich the user query for better semantic matching.
-    Returns only the expanded query text.
+    Generates recommendations based on semantic search and duration boosting.
     """
-    global client
-    if not client:
-        return original_query
-        
-    system_instruction = (
-        "You are an intelligent Query Expansion Engine for an Assessment Recommendation System. "
-        "Your task is to rewrite the given hiring query into a single, comprehensive paragraph "
-        "that includes all implied skills, job roles, duration constraints (in minutes), and necessary "
-        "assessment types (e.g., 'technical skills', 'behavioral competencies', 'aptitude', 'coding', 'sales'). "
-        "DO NOT add any conversational text. Only output the expanded query."
-    )
-    
-    max_retries = 3
-    base_delay = 2
-    
-    for attempt in range(max_retries):
-        try:
-            # Call the API
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=f"Original Query: {original_query}",
-                config={"system_instruction": system_instruction}
-            )
-            
-            expanded_query = response.text.strip()
-            return expanded_query
-
-        except APIError:
-            if attempt < max_retries - 1:
-                time.sleep(base_delay * (2 ** attempt))
-            else:
-                return original_query
-        except Exception:
-            return original_query 
-
-    return original_query
-
-# --- Core Recommendation Logic (34.44% Winner) ---\
-def get_recommendations(original_query):
-    """
-    Implements the winning 34.44% strategy: LLM Query Expansion + High Duration Multiplier.
-    """
-    # 1. LLM Query Expansion (Gets a single string)
-    query_text = llm_rewrite_query(original_query)
-    
-    # 2. Extract Duration (from the expanded text)
-    duration_match = re.search(r'(\d+)\s*(minutes?|hrs?|hours?|hour|min)', query_text, re.IGNORECASE)
-    
-    query_duration = None
-    if duration_match:
-        value = int(duration_match.group(1))
-        unit = duration_match.group(2).lower()
-        query_duration = value * 60 if 'hr' in unit or 'hour' in unit else value
-    
-    
-    # 3. Semantic Search (Cosine Similarity)
-    query_embedding = get_query_embedding(query_text)
-    if query_embedding is None:
+    if not query:
+        print("Debug: Query is empty, returning [].")
         return []
-        
-    semantic_scores = np.dot(assessment_embeddings, query_embedding)
+    
+    # CRITICAL CHECK 1: Ensure matrix and data are loaded
+    if EMBEDDINGS_MATRIX is None or len(ASSESSMENTS_DATA) == 0:
+        print("Error: Data or embedding matrix not initialized in get_recommendations.", file=sys.stderr)
+        return []
+
+    # 1. Embed the user query
+    try:
+        query_embedding = EMBEDDING_MODEL.encode(query, convert_to_tensor=False)
+        query_embedding = np.expand_dims(query_embedding, axis=0) 
+    except Exception as e:
+        print(f"Error embedding query: {e}", file=sys.stderr)
+        return []
+
+    # 2. Extract duration from query
+    query_duration = extract_duration(query)
+    print(f"Debug: Extracted duration from query: {query_duration} mins")
+
+    # 3. Calculate Semantic Scores (Cosine Similarity)
+    try:
+        semantic_scores = cosine_similarity(query_embedding, EMBEDDINGS_MATRIX)[0]
+    except Exception as e:
+        print(f"Error during cosine similarity calculation: {e}", file=sys.stderr)
+        return []
     
     final_scores = []
     
-    # 4. Apply Final Duration Boost (Multiplier)
-    for i, item in enumerate(all_assessments):
+    # 4. Apply Final Duration Boost
+    for i, item in enumerate(ASSESSMENTS_DATA): 
         semantic_score = semantic_scores[i]
-        
+
         duration_boost_factor = 0.0
-        doc_duration = item.get('duration')
-        
+        doc_duration = item.get('duration') # duration key MUST exist and be a number
+
         if query_duration is not None and doc_duration:
-            # Tolerance (e.g., +/- 15 minutes or 25% of query duration)
+            # Check to ensure doc_duration is numeric before calculation
+            if not isinstance(doc_duration, (int, float)):
+                 print(f"Warning: Duration for item {i} is non-numeric: {doc_duration}")
+                 doc_duration = 0 # Treat as non-match
+                 
             tolerance = max(15, query_duration * 0.25) 
-            
+
             if abs(doc_duration - query_duration) <= tolerance:
                 duration_boost_factor = DURATION_MULTIPLIER 
-                    
-        # Final Score = Semantic Score * (1 + Duration Boost Factor)
+
         final_score = semantic_score * (1 + duration_boost_factor)
         final_scores.append(final_score)
 
-    # 5. Get the Top N (Max 10) indices
+    # 5. Get the Top N indices (we sort all, then iterate for uniqueness)
     final_scores = np.array(final_scores)
-    top_indices = np.argsort(final_scores)[-MAX_RECOMMENDATIONS:][::-1]
-    
-    # 6. Retrieve the full assessment data
-    recommended_assessments = [all_assessments[i] for i in top_indices]
-    return recommended_assessments
+    # argsort gives indices from lowest to highest score. [::-1] reverses to descending order.
+    # We take all indices to ensure we find MAX_RECOMMENDATIONS unique items.
+    all_sorted_indices = np.argsort(final_scores)[::-1] 
 
-# =======================================================
-#  ENDPOINT 1: Health Check
-# =======================================================
-@app.route('/health', methods=['GET'])
-def health_check():
-    print("Health check endpoint was hit!")
-    return jsonify({"status": "healthy"}), 200
-
-# =======================================================
-#  ENDPOINT 2: Recommendation
-# =======================================================
-@app.route('/recommend', methods=['POST'])
-def recommend_assessments():
-    global all_assessments, assessment_embeddings
+    # 6. Retrieve the full assessment objects while enforcing UNIQUNESS
+    final_results = []
+    recommended_normalized_urls = set() # Changed to store NORMALIZED URLs
     
-    if assessment_embeddings is None:
-        return jsonify({"error": "Assessment database not loaded. Check server logs."}), 500
+    # Function to ensure all required fields are present for the frontend
+    def sanitize_assessment(item, score):
+        # We ensure a default empty list if 'test_type' is missing/not a list
+        test_types_list = item.get('test_type')
+        if not isinstance(test_types_list, list):
+             test_types_list = ['N/A']
+             
+        # Add the score back for the frontend display
+        item_copy = copy.deepcopy(item)
+        item_copy['score'] = float(score)
+             
+        return {
+            "url": item_copy.get('url', '#'), # Use the original (non-normalized) URL for the link
+            "name": item_copy.get('name', 'N/A'),
+            "description": item_copy.get('description', 'No description available.'),
+            "test_type": test_types_list,
+            "duration": item_copy.get('duration'), 
+            "remote_support": item_copy.get('remote_support', 'N/A'),
+            "adaptive_support": item_copy.get('adaptive_support', 'N/A'),
+            "score": item_copy['score'] # Ensure score is included
+        }
+
+    for index in all_sorted_indices:
+        item = ASSESSMENTS_DATA[index]
+        score = final_scores[index]
+        original_url = item.get('url')
         
-    data = request.get_json()
-    user_query = data.get('query', '')
-    
-    if not user_query:
-        return jsonify({"error": "No query provided in request body."}), 400
+        # CRITICAL DEDUPLICATION STEP: Use the normalized URL for the set check
+        normalized_url = normalize_url(original_url)
+        
+        if normalized_url and normalized_url not in recommended_normalized_urls:
+            final_results.append(sanitize_assessment(item, score))
+            recommended_normalized_urls.add(normalized_url)
+        
+        # Stop once we have MAX_RECOMMENDATIONS unique items
+        if len(final_results) >= MAX_RECOMMENDATIONS:
+            break
+            
+    print(f"Debug: Successfully generated {len(final_results)} UNIQUE recommendations.")
+    return final_results
 
-    print(f"Received query: {user_query}")
-    
-    # Get the list of recommended assessment objects
-    recommended_list = get_recommendations(user_query)
-    
-    recommendations = []
-    for item in recommended_list:
-        # Filter and structure the output data exactly as required by the assignment
-        recommendations.append({
-            "url": item.get("url"),
-            "name": item.get("name"),
-            "adaptive_support": item.get("adaptive_support"),
-            "description": item.get("description"),
-            "duration": item.get("duration"),
-            "remote_support": item.get("remote_support"),
-            "test_type": item.get("test_type")
-        })
 
-    return jsonify({
-        "recommended_assessments": recommendations
-    }), 200
+# --- 3. Flask App Initialization and Endpoints ---
+app = Flask(__name__)
+CORS(app) 
 
-# =======================================================
-#  RUN THE APP
-# =======================================================
-if __name__ == '__main__':
-    print("Starting the SHL Recommendation API...")
-
-    # --- Load the Database on Start ---\
-    print("Attempting to load assessment database...")
+@app.route('/')
+def main_page():
+    # ... (Main page serving index.html remains the same)
     try:
-        with open('shl_embeddings.json', 'r') as f:
-            all_assessments = json.load(f)
-        
-        # Ensure that every item has an embedding array
-        assessment_embeddings = np.array([item['embedding'] for item in all_assessments if 'embedding' in item])
-        
-        # Filter all_assessments to only include items that successfully loaded an embedding
-        all_assessments = [item for item in all_assessments if 'embedding' in item]
-        
-        print(f"Loaded {len(all_assessments)} assessments into memory.")
-        print(f"Embedding matrix shape: {assessment_embeddings.shape}")
-        
+        with open('index.html', 'r') as f:
+            html_content = f.read()
+        return render_template_string(html_content)
     except FileNotFoundError:
-        print("="*50)
-        print(" WARNING: 'shl_embeddings.json' not found.")
-        print(" Please run 'python create_embeddings.py' first!")
-        print("="*50)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error loading 'shl_embeddings.json': {e}")
-        sys.exit(1)
+        return "Error: index.html not found. Please ensure all files are in the same directory.", 404
 
-    # Note: Flask runs on 127.0.0.1:5000 by default in development mode
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+@app.route('/recommend', methods=['POST'])
+def recommend_endpoint():
+    data = request.get_json(silent=True)
+    query = data.get('query', '').strip()
+
+    if not query:
+        return jsonify({"error": "Query field cannot be empty."}), 400
+
+    try:
+        recommendations = get_recommendations(query)
+        # If no recommendations, return an empty list
+        if not recommendations:
+            return jsonify([]) 
+            
+        return jsonify(recommendations) 
+    
+    except Exception as e:
+        print(f"An unexpected error occurred during recommendation for query '{query}': {e}", file=sys.stderr)
+        return jsonify({"error": "An internal error occurred while processing the request."}), 500
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting Flask application on port {port}...")
+    app.run(debug=True, host='0.0.0.0', port=port, use_reloader=False)

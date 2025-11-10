@@ -1,0 +1,13 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data files (they are too big for GitHub)
+shl_assessments.json
+shl_embeddings.json
+
+# Secret keys (if you ever use them)
+.env
