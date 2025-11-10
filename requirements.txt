@@ -10,3 +10,5 @@ openpyxl
 sentence-transformers
 torch
 google-genai # <--- ADD THIS LINE
+gunicorn
+uvicorn
